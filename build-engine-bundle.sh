@@ -42,6 +42,7 @@ rsync -a --exclude '__pycache__' --exclude '*.pyc' "$SRC_SP/" "$PYDIR/lib/python
 # bundle, never inside it, so a bundle update can't clobber it.
 echo "▶ Stage 3: engine source…"
 cp "$ROOT"/engine/*.py "$ENG/"
+[ -d "$ROOT/engine/fonts" ] && cp -R "$ROOT/engine/fonts" "$ENG/fonts"   # OFL fonts for wordmarks
 
 echo "▶ Stage 4: vendor the GPL CLI tools + relocate their dylibs…"
 mkdir -p "$ENG/bin" "$ENG/libs" "$ENG/tools"

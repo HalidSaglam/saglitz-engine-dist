@@ -1,4 +1,4 @@
-"""Saglitz Studio — local image-generation engine (mflux / Apple MLX).
+"""Saglitz Photo Studio — local image-generation engine (mflux / Apple MLX).
 
 A small FastAPI server that loads one or more image models (FLUX.1 and
 Z-Image-Turbo) into memory and exposes them over HTTP so both the native
@@ -663,7 +663,7 @@ def _safe_loras(loras: Optional[list[dict]], reg: dict) -> Optional[list[dict]]:
 
 
 # --- app -----------------------------------------------------------------
-app = FastAPI(title="Saglitz Studio Engine")
+app = FastAPI(title="Saglitz Photo Studio Engine")
 
 
 @app.on_event("startup")
@@ -3384,6 +3384,242 @@ def image_removebg(req: RemoveBGRequest) -> dict:
     out_img.save(out)
     return {"file": out_name, "project": proj, "url": f"/media/{proj}/{out_name}",
             "width": out_img.width, "height": out_img.height}
+
+
+# === Logo Creator: styled lettermarks (reuses the image + rembg pipeline) ========
+# Prompt templates per style. {t} = the letter/word, {c} = accent-colour word.
+LOGO_STYLES: dict[str, dict] = {
+    "crystal":  {"label": "Crystal", "p":
+        "a single logo lettermark '{t}', sculpted from clear faceted crystal, sharp clean "
+        "geometric facets, {c} and cyan light refraction with prism dispersion, glossy polished "
+        "gemstone, bright specular highlights, centered, deep near-black background, 3D product "
+        "render, studio lighting, ultra sharp, highly detailed, minimalist"},
+    "amethyst": {"label": "Amethyst gem", "p":
+        "a single logo lettermark '{t}', carved from a faceted {c} amethyst gemstone, sharp "
+        "crystalline facets, deep saturated colour, glossy, dramatic studio lighting, centered, "
+        "dark background, 3D render, ultra sharp, minimalist"},
+    "gold":     {"label": "Gold", "p":
+        "a single logo lettermark '{t}', polished 3D gold metal, luxury, reflective, subtle "
+        "engraving, warm rim light, centered, dark background, 3D render, ultra sharp, premium, minimalist"},
+    "chrome":   {"label": "Chrome", "p":
+        "a single logo lettermark '{t}', liquid chrome metal, mirror-reflective, futuristic, {c} "
+        "reflections, centered, dark studio background, 3D render, ultra sharp, minimalist"},
+    "glass":    {"label": "Glass", "p":
+        "a single logo lettermark '{t}', frosted translucent glass, soft {c} tint, gentle "
+        "refraction, soft studio lighting, centered, dark background, 3D render, clean, minimalist"},
+    "neon":     {"label": "Neon", "p":
+        "a single logo lettermark '{t}', glowing {c} neon tube sign, bright emissive glow, subtle "
+        "reflection, dark wall background, centered, night, ultra sharp, minimalist"},
+    "gradient": {"label": "Flat gradient", "p":
+        "a clean minimalist flat logo lettermark '{t}', smooth {c} gradient fill, modern geometric "
+        "vector style, centered, plain white background, crisp, simple"},
+    "matte3d":  {"label": "Soft 3D", "p":
+        "a single logo lettermark '{t}', soft matte 3D inflated rounded letter, smooth clay render, "
+        "pastel {c}, soft global illumination, centered, light neutral background, clean, minimalist"},
+    "emblem":   {"label": "Emblem", "p":
+        "an elegant emblem logo monogram '{t}', {c} and gold, refined line work, symmetrical badge, "
+        "luxury brand mark, centered, dark background, crisp, detailed"},
+    "holographic": {"label": "Holographic", "p":
+        "a single logo lettermark '{t}', iridescent holographic foil, rainbow {c} sheen, shifting "
+        "spectral reflections, glossy, centered, dark background, 3D render, ultra sharp, minimalist"},
+    "marble":   {"label": "Marble", "p":
+        "a single logo lettermark '{t}', polished white marble with fine {c} and gold veins, "
+        "smooth stone, soft studio lighting, centered, neutral background, 3D render, luxury, minimalist"},
+    "obsidian": {"label": "Obsidian", "p":
+        "a single logo lettermark '{t}', carved black obsidian volcanic glass, glossy reflective, "
+        "subtle {c} edge glow, dramatic lighting, centered, dark background, 3D render, ultra sharp, minimalist"},
+    "rosegold": {"label": "Rose gold", "p":
+        "a single logo lettermark '{t}', polished rose gold metal, luxury, soft reflections, warm "
+        "pink highlights, centered, dark background, 3D render, premium, ultra sharp, minimalist"},
+    "ice":      {"label": "Frost / ice", "p":
+        "a single logo lettermark '{t}', frozen clear ice with frost, cold {c} and cyan tint, tiny "
+        "bubbles and cracks, glossy, centered, dark background, 3D render, ultra sharp, minimalist"},
+    "liquidmetal": {"label": "Liquid metal", "p":
+        "a single logo lettermark '{t}', flowing liquid mercury metal, mirror-reflective chrome with "
+        "{c} reflections, smooth organic surface, centered, dark studio background, 3D render, ultra sharp"},
+    "paper":    {"label": "Paper cut", "p":
+        "a single logo lettermark '{t}', layered paper cut craft, soft shadows between {c} paper "
+        "layers, handmade, centered, clean light background, top-down, minimalist, crisp"},
+    "outline":  {"label": "Monoline", "p":
+        "a clean minimalist monoline logo lettermark '{t}', single even {c} outline stroke, modern "
+        "geometric vector, flat, centered, plain white background, crisp, simple, elegant"},
+    "wood":     {"label": "Carved wood", "p":
+        "a single logo lettermark '{t}', carved polished walnut wood, natural grain, warm, soft "
+        "studio lighting, centered, neutral background, 3D render, premium, minimalist"},
+}
+_LOGO_NEG = ("extra letters, words, paragraph, caption, watermark, signature, blurry, low quality, "
+             "jpeg artifacts, deformed, distorted, busy background, frame, border, mockup")
+
+
+class LogoRequest(BaseModel):
+    text: str
+    style: str = "crystal"
+    color: str = "violet"
+    font: Optional[str] = None       # OFL font id; wordmark render / img2img structure
+    model: Optional[str] = None
+    seed: Optional[int] = None
+    count: int = 1
+    transparent: bool = False
+    project: Optional[str] = None
+    width: int = 1024
+    height: int = 1024
+
+
+# --- OFL fonts (bundled, redistributable) for exact wordmarks / font-guided logos --
+_FONTS_DIR = Path(__file__).resolve().parent / "fonts"
+
+
+def _list_fonts() -> list[dict]:
+    out = []
+    if _FONTS_DIR.exists():
+        for f in sorted(_FONTS_DIR.glob("*.ttf")):
+            out.append({"id": f.stem, "label": f.stem.replace("-", " ")})
+    return out
+
+
+def _font_file(font_id: str) -> str:
+    p = (_FONTS_DIR / f"{os.path.basename(font_id or '')}.ttf").resolve()
+    if not p.exists() or _FONTS_DIR.resolve() not in p.parents:
+        raise HTTPException(status_code=400, detail=f"Unknown font '{font_id}'.")
+    return str(p)
+
+
+_LOGO_COLORS = {
+    "violet": (150, 110, 240), "purple": (150, 90, 220), "indigo": (99, 102, 241),
+    "gold": (212, 175, 55), "white": (245, 245, 250), "black": (18, 18, 22),
+    "cyan": (80, 200, 230), "pink": (240, 120, 180), "red": (230, 70, 70),
+    "blue": (80, 120, 240), "green": (70, 200, 130), "orange": (240, 150, 60),
+}
+
+
+def _logo_rgb(c: str) -> tuple:
+    c = (c or "").strip().lower()
+    if c in _LOGO_COLORS:
+        return _LOGO_COLORS[c]
+    if c.startswith("#"):
+        h = c[1:]
+        if len(h) == 3:
+            h = "".join(ch * 2 for ch in h)
+        if len(h) == 6:
+            try:
+                return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+            except ValueError:
+                pass
+    return _LOGO_COLORS["violet"]
+
+
+def _fit_font(draw, text: str, font_path: str, W: int, H: int):
+    from PIL import ImageFont
+    size = H
+    for _ in range(24):
+        f = ImageFont.truetype(font_path, size)
+        bb = draw.textbbox((0, 0), text, font=f)
+        if (bb[2] - bb[0]) <= W * 0.84 and (bb[3] - bb[1]) <= H * 0.66:
+            return f, bb
+        size = max(8, int(size * 0.9))
+    f = ImageFont.truetype(font_path, size)
+    return f, draw.textbbox((0, 0), text, font=f)
+
+
+def _render_wordmark(text, font_id, color, width, height, transparent, proj) -> dict:
+    """Exact text in an OFL font — no model, fully commercial-clean."""
+    from PIL import Image, ImageDraw
+    W, H = _round16(width), _round16(height)
+    fp = _font_file(font_id)
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0) if transparent else (14, 13, 20, 255))
+    d = ImageDraw.Draw(img)
+    f, bb = _fit_font(d, text, fp, W, H)
+    tw, th = bb[2] - bb[0], bb[3] - bb[1]
+    d.text(((W - tw) / 2 - bb[0], (H - th) / 2 - bb[1]), text, font=f, fill=(*_logo_rgb(color), 255))
+    dd = _project_dir(proj)
+    name = f"wordmark_{uuid.uuid4().hex[:6]}.png"
+    img.save(dd / name)
+    return {"file": name, "project": proj, "url": f"/media/{proj}/{name}", "width": W, "height": H}
+
+
+def _render_letterform_init(text, font_id, width, height, proj) -> str:
+    """White text on near-black — an img2img structure so styling keeps this font."""
+    from PIL import Image, ImageDraw
+    W, H = _round16(width), _round16(height)
+    fp = _font_file(font_id)
+    img = Image.new("RGB", (W, H), (8, 8, 10))
+    d = ImageDraw.Draw(img)
+    f, bb = _fit_font(d, text, fp, W, H)
+    tw, th = bb[2] - bb[0], bb[3] - bb[1]
+    d.text(((W - tw) / 2 - bb[0], (H - th) / 2 - bb[1]), text, font=f, fill=(238, 238, 245))
+    p = _project_dir(proj) / f"_init_{uuid.uuid4().hex[:6]}.png"
+    img.save(p)
+    return str(p)
+
+
+@app.get("/api/logo/fonts")
+def logo_fonts() -> dict:
+    return {"fonts": _list_fonts()}
+
+
+@app.get("/api/logo/styles")
+def logo_styles() -> dict:
+    return {"styles": [{"id": k, "label": v["label"]} for k, v in LOGO_STYLES.items()]}
+
+
+def _logo_cutout(proj: str, fname: str) -> Optional[dict]:
+    """Remove a generated logo's background -> transparent PNG (reuses rembg/BiRefNet)."""
+    from rembg import remove
+    from PIL import Image
+    d = _project_dir(proj)
+    src = _safe_project_file(d, fname)
+    try:
+        with _rembg_lock:
+            out_img = _mlx(lambda: remove(Image.open(src).convert("RGBA"), session=_rembg()))
+    except Exception:
+        return None
+    out_name = f"logo_{uuid.uuid4().hex[:6]}.png"
+    out_img.save(d / out_name)
+    return {"file": out_name, "project": proj, "url": f"/media/{proj}/{out_name}",
+            "width": out_img.width, "height": out_img.height}
+
+
+@app.post("/api/logo/generate")
+def logo_generate(req: LogoRequest) -> dict:
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Enter a letter or short word.")
+    if len(text) > 24:
+        raise HTTPException(status_code=400, detail="Keep the logo text short (24 characters max).")
+    color = (req.color or "violet").strip() or "violet"
+    proj = _safe_project(req.project or "Logos")
+    n = max(1, min(6, req.count))
+
+    # Pure wordmark — exact text in the chosen OFL font, no model (commercial-clean).
+    if req.style == "wordmark":
+        if not req.font:
+            raise HTTPException(status_code=400, detail="Pick a font for the wordmark.")
+        res = _render_wordmark(text, req.font, color, req.width, req.height, req.transparent, proj)
+        return {"style": "wordmark", "font": req.font, "results": [res]}
+
+    style = LOGO_STYLES.get(req.style)
+    if not style:
+        raise HTTPException(status_code=400, detail=f"Unknown style '{req.style}'.")
+    prompt = style["p"].format(t=text, c=color)
+
+    # Font-guided styling: render the exact letterform, then restyle it via img2img so
+    # the output keeps that font. Uses the commercial base model — NO ControlNet (the
+    # only catalog ControlNet is FLUX Canny, which is non-commercial).
+    init_path = _render_letterform_init(text, req.font, req.width, req.height, proj) if req.font else None
+
+    results = []
+    for i in range(n):
+        seed = (req.seed + i) if req.seed is not None else int.from_bytes(uuid.uuid4().bytes[:4], "big")
+        gr = GenerateRequest(prompt=prompt, negative_prompt=_LOGO_NEG, model=req.model,
+                             width=req.width, height=req.height, seed=seed, project=proj,
+                             image_path=init_path,
+                             image_strength=(0.72 if init_path else None))
+        res = generate(gr)                       # reuses the gen lock + model dispatch
+        if req.transparent:
+            res = _logo_cutout(proj, res["file"]) or res
+        res["seed"] = seed
+        results.append(res)
+    return {"prompt": prompt, "style": req.style, "font": req.font, "results": results}
 
 
 # === Storage: model disk usage map + cleanup ====================================
