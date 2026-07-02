@@ -3,11 +3,11 @@
   <channel>
     <title>Saglitz Studio</title>
     <item>
-      <title>1.2</title>
-      <sparkle:version>3</sparkle:version>
-      <sparkle:shortVersionString>1.2</sparkle:shortVersionString>
+      <title>1.3</title>
+      <sparkle:version>4</sparkle:version>
+      <sparkle:shortVersionString>1.3</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-      <enclosure url="https://github.com/HalidSaglam/saglitz-engine/releases/download/app-updates/Saglitz-Studio.dmg" sparkle:edSignature="bS0em6ZavyYvxd4pAmj9HcDgKKvWSe7DB8p++vDOgKUXhje9hDYq2OMkg9MiiFR6Ht+KWLKDPq1XOKGYT1pYCA==" length="7264282" type="application/x-apple-diskimage"/>
+      <enclosure url="https://github.com/HalidSaglam/saglitz-engine/releases/download/app-updates/Saglitz-Studio.dmg" sparkle:edSignature="Lx5KZLUW65Wq8i/Xym3Yj7P/RfMFpdu5EAfJ8SX3CwvzR0Sn8Gag7o0cF1MhHTigKqrBO7HIq4inFn/diGAzBw==" length="7270237" type="application/x-apple-diskimage"/>
     </item>
   </channel>
 </rss>
