@@ -531,11 +531,20 @@ def _atomic_write_json(path: Path, obj) -> None:
     os.replace(tmp, path)
 
 
+_HISTORY_MAX = 5000        # cap global history so it can't grow without bound
+
+
 def _read_history() -> list[dict]:
     if HISTORY_FILE.exists():
         try:
             return json.loads(HISTORY_FILE.read_text())
         except json.JSONDecodeError:
+            # Don't silently return [] — the next append would then overwrite and
+            # WIPE history. Set the corrupt file aside so it can be recovered.
+            try:
+                HISTORY_FILE.rename(HISTORY_FILE.with_suffix(".corrupt.json"))
+            except OSError:
+                pass
             return []
     return []
 
@@ -544,6 +553,7 @@ def _append_history(entry: dict) -> None:
     with _history_lock:
         hist = _read_history()
         hist.insert(0, entry)
+        del hist[_HISTORY_MAX:]        # keep only the most recent, bounded
         _atomic_write_json(HISTORY_FILE, hist)
 
 
@@ -1775,10 +1785,31 @@ def _do_video(name: str, project: str, prompt: str, width: int, height: int,
         # noise). 0.25–0.4 preserves the subject while still adding real motion.
         cmd += ["--image", image_path, "--strength", str(max(0.1, min(0.85, image_strength)))]
     t0 = time.time()
-    proc = _run(cmd, capture_output=True, text=True, timeout=_DT_GEN_TIMEOUT)  # video render can be minutes
+    # Popen (not _run) + register the proc so /api/cancel can stop a video render,
+    # and a hung CLI can't pin _gen_lock for the whole timeout, wedging generation.
+    proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True)
+    with _proc_lock:
+        global _current_dt_proc
+        _current_dt_proc = proc
+    try:
+        v_out, v_err = proc.communicate(timeout=_DT_GEN_TIMEOUT)   # render can be minutes
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.communicate(timeout=10)
+        except Exception:
+            pass
+        with _proc_lock:
+            _current_dt_proc = None
+        raise HTTPException(status_code=504, detail="Video generation timed out (CLI did not respond).")
+    with _proc_lock:
+        _current_dt_proc = None
     if proc.returncode != 0 or not os.path.isfile(out):
+        if proc.returncode is not None and proc.returncode < 0:    # killed by /api/cancel
+            raise HTTPException(status_code=499, detail="Video generation cancelled.")
         raise HTTPException(status_code=500,
-                            detail=f"Video generation failed: {(proc.stderr or proc.stdout)[-300:]}")
+                            detail=f"Video generation failed: {(v_err or v_out or '')[-300:]}")
     if smooth:
         _smooth_video(out, factor=2)       # full-res frame interpolation
     elapsed = time.time() - t0
