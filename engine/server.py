@@ -832,6 +832,26 @@ def history(project: Optional[str] = None) -> list[dict]:
 # --- Draw Things model manager (Phase 2) --------------------------------------
 _dt_downloads: dict[str, dict[str, Any]] = {}   # ckpt -> {status, error}
 _dt_dl_lock = threading.Lock()
+_dt_dl_procs: dict[str, "subprocess.Popen"] = {}   # ckpt -> running proc (for cancel)
+_dt_dl_cancel: set[str] = set()                    # ckpts the user asked to cancel
+
+
+def _dt_want_cancel(ckpt: str) -> bool:
+    with _dt_dl_lock:
+        return ckpt in _dt_dl_cancel
+
+
+def _dt_finish_cancel(ckpt: str, *partials) -> None:
+    """Wipe the partials and clear all state for a cancelled download."""
+    for p in partials:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+    with _dt_dl_lock:
+        _dt_downloads.pop(ckpt, None)
+        _dt_dl_cancel.discard(ckpt)
+        _dt_dl_procs.pop(ckpt, None)
 
 
 def _dt_partial_mb(ckpt: str) -> Optional[int]:
@@ -852,11 +872,16 @@ def _dt_download_worker(ckpt: str) -> None:
     partial = DT_MODELS_DIR / (ckpt + ".partial")
     pmap = DT_MODELS_DIR / (ckpt + ".partial.map")
     for attempt in range(10):
+        if _dt_want_cancel(ckpt):
+            _dt_finish_cancel(ckpt, partial, pmap)
+            return
         start_size = _dt_partial_mb(ckpt) or 0
         try:
             proc = subprocess.Popen(
                 [_DT_CLI, "models", "ensure", "--models-dir", str(DT_MODELS_DIR), "--model", ckpt],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            with _dt_dl_lock:
+                _dt_dl_procs[ckpt] = proc
         except Exception as exc:
             with _dt_dl_lock:
                 _dt_downloads[ckpt] = {"status": "error", "error": str(exc)}
@@ -864,6 +889,10 @@ def _dt_download_worker(ckpt: str) -> None:
         last_size, stalls = start_size, 0
         while proc.poll() is None:
             time.sleep(10)
+            if _dt_want_cancel(ckpt):
+                proc.kill()
+                _dt_finish_cancel(ckpt, partial, pmap)
+                return
             sz = _dt_partial_mb(ckpt) or 0
             if sz > last_size:
                 last_size, stalls = sz, 0
@@ -951,6 +980,20 @@ def dt_download(ref: DTModelRef) -> dict:
         _dt_downloads[ref.ckpt] = {"status": "downloading"}
     threading.Thread(target=_dt_download_worker, args=(ref.ckpt,), daemon=True).start()
     return {"status": "downloading"}
+
+
+@app.post("/api/dt/models/download/cancel")
+def dt_download_cancel(ref: DTModelRef) -> dict:
+    """Stop an in-flight model download and wipe its partial."""
+    with _dt_dl_lock:
+        _dt_dl_cancel.add(ref.ckpt)
+        p = _dt_dl_procs.get(ref.ckpt)
+    if p is not None:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    return {"status": "cancelling"}
 
 
 @app.post("/api/dt/models/delete")
@@ -1127,6 +1170,8 @@ def dt_lora_delete(ref: LoRARef) -> dict:
 # --- LoRA training (draw-things-cli train lora) -------------------------------
 _train: dict[str, Any] = {"status": "idle"}     # idle | running | done | error
 _train_lock = threading.Lock()
+_train_proc: Optional["subprocess.Popen"] = None   # running train subprocess (for cancel)
+_train_cancel = False
 
 
 class TrainRequest(BaseModel):
@@ -1139,10 +1184,26 @@ class TrainRequest(BaseModel):
 
 
 def _train_worker(cmd: list[str], out_prefix: str, dry: bool) -> None:
+    global _train_proc, _train_cancel
     try:
-        proc = _run(cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=7200)
+        # Popen (not _run) so a 2-hour run can be cancelled by killing the process.
+        proc = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        with _train_lock:
+            _train_proc = proc
+        try:
+            out, err = proc.communicate(timeout=7200)
+        except subprocess.TimeoutExpired:
+            proc.kill(); out, err = proc.communicate()
+        with _train_lock:
+            _train_proc = None
+        if _train_cancel:                       # user cancelled → not an error
+            _train_cancel = False
+            with _train_lock:
+                _train.clear(); _train.update(status="idle")
+            return
         ok = proc.returncode == 0
-        log = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        log = ((out or "") + "\n" + (err or "")).strip()
         # Strip ANSI escapes / carriage returns so the JSON status stays clean.
         log = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", log).replace("\r", "")
         produced = None
@@ -1202,8 +1263,25 @@ def dt_train_start(req: TrainRequest) -> dict:
         _train.clear()
         _train.update(status="running", base=req.base, dataset=ds, steps=steps,
                       rank=rank, name=slug, dry_run=req.dry_run, log="")
+    global _train_cancel
+    _train_cancel = False          # clear any stale cancel from a prior run
     threading.Thread(target=_train_worker, args=(cmd, slug, req.dry_run), daemon=True).start()
     return {"status": "running", "name": slug, "images": len(imgs)}
+
+
+@app.post("/api/dt/train/cancel")
+def dt_train_cancel() -> dict:
+    """Stop an in-flight training run and reset to idle."""
+    global _train_cancel
+    _train_cancel = True
+    with _train_lock:
+        p = _train_proc
+    if p is not None:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    return {"status": "cancelling"}
 
 
 @app.get("/api/dt/train/status")
@@ -2616,6 +2694,11 @@ class CivitaiDownloadRef(BaseModel):
 
 _civitai_dl: dict[str, Any] = {"status": "idle"}
 _civitai_lock = threading.Lock()
+_civitai_cancel = False                 # set by the cancel endpoint; the worker checks it
+
+
+class _DLCancelled(Exception):
+    """Raised inside a download worker when the user cancels."""
 
 
 def _civitai_download_worker(url: str, filename: str, kind: str, token: str, base_hint: str = "") -> None:
@@ -2629,6 +2712,8 @@ def _civitai_download_worker(url: str, filename: str, kind: str, token: str, bas
             total = int(r.headers.get("Content-Length", 0))
             done = 0
             while True:
+                if _civitai_cancel:
+                    raise _DLCancelled()
                 chunk = r.read(1 << 20)
                 if not chunk:
                     break
@@ -2681,6 +2766,13 @@ def _civitai_download_worker(url: str, filename: str, kind: str, token: str, bas
                     _civitai_dl.update(status="done", file=final.name, kind="checkpoint",
                                        produced_ckpt=produced, base=base_hint or None,
                                        log=(proc.stdout or "")[-200:])
+    except _DLCancelled:
+        try:
+            tmp.unlink(missing_ok=True)
+        except (NameError, OSError):
+            pass
+        with _civitai_lock:
+            _civitai_dl.update(status="idle")
     except Exception as exc:
         try:                          # drop the orphaned .part so failures don't pile up GBs
             tmp.unlink(missing_ok=True)
@@ -2692,16 +2784,26 @@ def _civitai_download_worker(url: str, filename: str, kind: str, token: str, bas
 
 @app.post("/api/civitai/download")
 def civitai_download(ref: CivitaiDownloadRef) -> dict:
+    global _civitai_cancel
     _validate_civitai_url(ref.download_url, allow_nsfw=ref.nsfw)
     with _civitai_lock:
         if _civitai_dl.get("status") == "downloading":
             raise HTTPException(status_code=409, detail="A Civitai download is already in progress.")
         _civitai_dl.clear()
         _civitai_dl.update(status="downloading", done_mb=0, total_mb=0)
+    _civitai_cancel = False        # clear any stale cancel from a prior run
     threading.Thread(target=_civitai_download_worker,
                      args=(ref.download_url, ref.filename, ref.kind,
                            ref.token or _civitai_token(), ref.base), daemon=True).start()
     return {"status": "downloading"}
+
+
+@app.post("/api/civitai/download/cancel")
+def civitai_download_cancel() -> dict:
+    """Stop the in-flight Civitai download (the worker wipes its .part)."""
+    global _civitai_cancel
+    _civitai_cancel = True
+    return {"status": "cancelling"}
 
 
 @app.get("/api/civitai/download/status")
