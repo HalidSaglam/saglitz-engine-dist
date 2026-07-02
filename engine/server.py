@@ -3903,8 +3903,10 @@ def logo_generate(req: LogoRequest) -> dict:
     if not style:
         raise HTTPException(status_code=400, detail=f"Unknown style '{req.style}'.")
     if req.kind == "symbol":
-        # reuse the chosen material, applied to a described symbol/icon instead of a letter
-        material = re.sub(r"^.*?'\{t\}',\s*", "", style["p"]).format(c=color)
+        # reuse the chosen material, applied to a described symbol/icon instead of a
+        # letter. Strip any leftover '{t}' first so a style whose template lacks the
+        # "'{t}'," prefix doesn't crash .format() with a KeyError.
+        material = re.sub(r"^.*?'\{t\}',\s*", "", style["p"]).replace("{t}", "").format(c=color)
         prompt = "a minimalist logo symbol / icon of " + text + ", " + material
     else:
         prompt = style["p"].format(t=text, c=color)
